@@ -1,108 +1,92 @@
-#!/usr/bin/env python3
 """
-Phase 1: 4-ch VQ-GAN reconstruction on BraTS2023
-Phase 2: 4-ch VQ-GAN + ODE temporal model on a longitudinal TCIA set
+4D VQ-GAN for Reconstruction on BraTS 2023 and Temporal Modeling on LUMIERE
+
+This script provides:
+ 1. BraTS2023Dataset loader for static reconstruction training
+ 2. LumiereDataset loader for longitudinal temporal training
+ 3. 3D VQ-GAN components (Encoder, Decoder, VectorQuantizer)
+ 4. Neural ODE temporal modeling (ODEFunc, ODEBlock)
+ 5. Physics-informed loss
+ 6. 3D Discriminator (PatchGAN style)
+ 7. Training loops: reconstruction & temporal + physics + GAN
+ 8. TensorBoard logging, validation, and loss-curve plotting
 
 Usage:
+  # Reconstruction on BraTS 2023
+  python fourd_vqgan_modified.py --mode train_recon \
+                                 --train_csv brats_train.csv \
+                                 --val_csv brats_val.csv \
+                                 --logdir runs/recon \
+                                 --save_dir outputs/recon
 
-# Phase 1: spatial only
-python train_recon_then_temporal.py \
-    --phase recon \
-    --data_root /path/to/BraTS23 \
-    --bs 2 --lr 1e-4 --epochs 50 \
-    --device cuda \
-    --logdir runs/brats_recon \
-    --save_dir outputs/brats_recon \
-    --lambda_gan 1.0
-
-# Phase 2: temporal on a TCIA‐style longitudinal CSV
-python train_recon_then_temporal.py \
-    --phase temporal \
-    --train_csv train_tciales.csv \
-    --val_csv   val_tciales.csv \
-    --bs 2 --lr 1e-4 --epochs 50 \
-    --device cuda \
-    --logdir runs/tcia_temp \
-    --save_dir outputs/tcia_temp \
-    --lambda_gan 1.0
+  # Temporal on LUMIERE
+  python fourd_vqgan_modified.py --mode train_temporal \
+                                 --train_csv lumiere_train.csv \
+                                 --val_csv lumiere_val.csv \
+                                 --logdir runs/temporal \
+                                 --save_dir outputs/temporal
 """
+import os
+import argparse
+import csv
 
-import os, glob, csv, argparse
-import nibabel as nib
-import numpy as np
-import torch, torch.nn as nn, torch.optim as optim
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
+import nibabel as nib
 import torchdiffeq
 import matplotlib.pyplot as plt
 
-# -----------------------------------------------------------------------------
-#  Dataset Loaders
-# -----------------------------------------------------------------------------
-
-class BraTSDataset(Dataset):
-    """4-channel BraTS2023 loader: each case folder must contain *_t1.nii.gz, *_t1ce.nii.gz, *_t2.nii.gz, *_flair.nii.gz"""
-    MODALITIES = ['t1','t1ce','t2','flair']
-    def __init__(self, root_dir, transform=None):
-        self.root = root_dir
-        self.cases = sorted(os.listdir(root_dir))
-        self.transform = transform
-
-    def __len__(self): return len(self.cases)
-
-    def __getitem__(self, idx):
-        case = self.cases[idx]
-        vols = []
-        for m in self.MODALITIES:
-            fn = glob.glob(os.path.join(self.root, case, f"*_{m}.nii.gz"))
-            if not fn:
-                raise FileNotFoundError(f"Missing {m} in {case}")
-            data = nib.load(fn[0]).get_fdata().astype('float32')
-            vols.append(data)
-        vol = np.stack(vols,0)              # [4,H,W,D]
-        vol = torch.from_numpy(vol)         # float32
-        if self.transform: vol = self.transform(vol)
-        return vol
-
-class LongitudinalMRIDataset(Dataset):
-    """
-    Expects a CSV with rows:
-      patient_id, time_delta, case_root
-    where each patient folder under case_root/patient_id/ contains:
-      patient_id_t{time_delta}_{modality}.nii.gz
-    for modalities in ['t1','t1ce','t2','flair'].
-    """
-    MODALITIES = ['t1','t1ce','t2','flair']
+# ---------------------- Dataset Loaders ----------------------
+class Brats2023Dataset(Dataset):
+    """Static dataset for single-timepoint BraTS 2023 reconstruction"""
     def __init__(self, csv_path, transform=None):
         self.entries = []
-        with open(csv_path) as f:
-            for row in csv.reader(f):
-                pid, td, root = row
-                self.entries.append((pid, float(td), root))
+        with open(csv_path, 'r') as f:
+            reader = csv.reader(f)
+            for pid, img_path in reader:
+                self.entries.append((pid, img_path))
         self.transform = transform
 
-    def __len__(self): return len(self.entries)
+    def __len__(self):
+        return len(self.entries)
 
     def __getitem__(self, idx):
-        pid, td, root = self.entries[idx]
-        vols = []
-        for m in self.MODALITIES:
-            pattern = os.path.join(root, pid, f"{pid}_t{int(td)}_{m}.nii.gz")
-            if not os.path.exists(pattern):
-                raise FileNotFoundError(pattern)
-            data = nib.load(pattern).get_fdata().astype('float32')
-            vols.append(data)
-        vol = np.stack(vols,0)
-        vol = torch.from_numpy(vol)
-        if self.transform: vol = self.transform(vol)
-        # we dummy a growth_rate here; you can replace with real metadata per patient
-        info = {'growth_rate': torch.tensor(0.05)}
-        return vol, info, torch.tensor(td, dtype=torch.float32)
+        pid, img_path = self.entries[idx]
+        img = nib.load(img_path).get_fdata().astype('float32')
+        vol = torch.from_numpy(img).unsqueeze(0)  # [1,H,W,D]
+        if self.transform:
+            vol = self.transform(vol)
+        # info and dummy timepoint (unused in reconstruction)
+        return vol, {'patient_id': pid}, torch.tensor(0.0)
 
-# -----------------------------------------------------------------------------
-#  Model Components
-# -----------------------------------------------------------------------------
 
+class LumiereDataset(Dataset):
+    """Longitudinal dataset loader for LUMIERE temporal modeling"""
+    def __init__(self, csv_path, transform=None):
+        self.entries = []
+        with open(csv_path, 'r') as f:
+            reader = csv.reader(f)
+            for pid, tp, img_path in reader:
+                self.entries.append((pid, float(tp), img_path))
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx):
+        pid, timepoint, img_path = self.entries[idx]
+        img = nib.load(img_path).get_fdata().astype('float32')
+        vol = torch.from_numpy(img).unsqueeze(0)  # [1,H,W,D]
+        if self.transform:
+            vol = self.transform(vol)
+        # info includes dummy growth_rate (could be replaced with real values)
+        return vol, {'patient_id': pid, 'growth_rate': 0.05}, torch.tensor(timepoint)
+
+
+# ---------------------- VQ-GAN Components ----------------------
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25):
         super().__init__()
@@ -111,268 +95,282 @@ class VectorQuantizer(nn.Module):
         self.commitment_cost = commitment_cost
 
     def forward(self, x):
-        B,C,H,W,D = x.shape
-        flat = x.permute(0,2,3,4,1).reshape(-1,C)
+        B, C, H, W, D = x.shape
+        flat = x.permute(0,2,3,4,1).reshape(-1, C)
         dist = (flat.pow(2).sum(1,keepdim=True)
                - 2*flat @ self.embedding.weight.t()
                + self.embedding.weight.pow(2).sum(1))
-        idx = torch.argmin(dist,dim=1)
-        onehot = torch.zeros(idx.size(0), self.embedding.num_embeddings, device=x.device)
-        onehot.scatter_(1, idx.unsqueeze(1), 1)
-        quant_flat = onehot @ self.embedding.weight
-        quant = quant_flat.view(B,H,W,D,C).permute(0,4,1,2,3)
+        idx = torch.argmin(dist, dim=1)
+        enc = torch.zeros(idx.size(0), self.embedding.num_embeddings, device=x.device)
+        enc.scatter_(1, idx.unsqueeze(1), 1)
+        quant_flat = enc @ self.embedding.weight
+        quant = quant_flat.view(B, H, W, D, C).permute(0,4,1,2,3)
         e_loss = nn.functional.mse_loss(quant.detach(), x)
         q_loss = nn.functional.mse_loss(quant, x.detach())
-        loss = q_loss + self.commitment_cost*e_loss
+        loss = q_loss + self.commitment_cost * e_loss
         quant = x + (quant - x).detach()
         return quant, loss
 
+
 class Encoder3D(nn.Module):
-    def __init__(self, in_ch=4, hidden=128, emb=64):
+    def __init__(self, in_ch=1, hidden=128, emb=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv3d(in_ch,hidden,4,2,1), nn.ReLU(),
-            nn.Conv3d(hidden,hidden,4,2,1), nn.ReLU(),
-            nn.Conv3d(hidden,emb,3,1,1)
+            nn.Conv3d(in_ch, hidden, 4, 2, 1), nn.ReLU(),
+            nn.Conv3d(hidden, hidden, 4, 2, 1), nn.ReLU(),
+            nn.Conv3d(hidden, emb, 3, 1, 1)
         )
-    def forward(self,x): return self.net(x)
+    def forward(self, x): return self.net(x)
+
 
 class Decoder3D(nn.Module):
-    def __init__(self, emb=64, hidden=128, out_ch=4):
+    def __init__(self, emb=64, hidden=128, out=1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.ConvTranspose3d(emb,hidden,4,2,1), nn.ReLU(),
-            nn.ConvTranspose3d(hidden,hidden,4,2,1), nn.ReLU(),
-            nn.Conv3d(hidden,out_ch,3,1,1), nn.Sigmoid()
+            nn.ConvTranspose3d(emb, hidden, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose3d(hidden, hidden, 4, 2, 1), nn.ReLU(),
+            nn.Conv3d(hidden, out, 3, 1, 1), nn.Sigmoid()
         )
-    def forward(self,x): return self.net(x)
+    def forward(self, x): return self.net(x)
 
+
+# ---------------------- Discriminator ----------------------
 class Discriminator3D(nn.Module):
-    def __init__(self, in_ch=4, feats=[64,128,256]):
+    def __init__(self, in_ch=1, features=[64,128,256]):
         super().__init__()
-        layers=[]
-        p=in_ch
-        for f in feats:
-            layers += [nn.Conv3d(p,f,4,2,1), nn.LeakyReLU(0.2,inplace=True)]
-            p=f
-        layers += [nn.Conv3d(p,1,4,1,0)]
+        layers = []
+        prev = in_ch
+        for f in features:
+            layers += [nn.Conv3d(prev, f, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True)]
+            prev = f
+        layers += [nn.Conv3d(prev, 1, 4, 1, 0)]  # PatchGAN
         self.net = nn.Sequential(*layers)
-    def forward(self,x): return self.net(x)
 
+    def forward(self, x):
+        return self.net(x)
+
+
+# ---------------------- Neural ODE Temporal ----------------------
 class ODEFunc(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim,dim*2), nn.ReLU(),
-                                 nn.Linear(dim*2,dim))
-    def forward(self,t,z): return self.net(z)
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim*2), nn.ReLU(), nn.Linear(dim*2, dim)
+        )
+    def forward(self, t, z): return self.net(z)
+
 
 class ODEBlock(nn.Module):
     def __init__(self, func, method='rk4', tol=1e-3):
         super().__init__()
         self.func, self.method, self.tol = func, method, tol
-    def forward(self, z, tpts):
-        B,C,H,W,D = z.shape
-        flat = z.reshape(B,-1)
-        out = torchdiffeq.odeint(self.func, flat, tpts.to(flat.device),
-                                 method=self.method,
-                                 atol=self.tol, rtol=self.tol)
-        return out[-1].reshape(B,C,H,W,D)
 
-# -----------------------------------------------------------------------------
-#  Physics‐informed loss (optional)
-# -----------------------------------------------------------------------------
+    def forward(self, z, timepts):
+        B, C, H, W, D = z.shape
+        flat = z.reshape(B, -1)
+        out = torchdiffeq.odeint(self.func, flat, timepts.to(flat.device),
+                                 method=self.method, atol=self.tol, rtol=self.tol)
+        return out[-1].reshape(B, C, H, W, D)
 
-def physics_loss(pred, info, t):
-    # smoothness + volume consistency
+
+# ---------------------- Physics-Informed Loss ----------------------
+def compute_physics_loss(pred, info, t):
     diff = pred - pred.detach()
-    change_pen = torch.mean(torch.abs(diff)/(t.view(-1,1,1,1,1)+1e-6))
-    voxel_vol=1.0
-    vol_pred = pred.sum([2,3,4])*voxel_vol
-    vol_exp  = info['growth_rate'].to(vol_pred.device)*t
-    growth_pen = torch.mean((vol_pred-vol_exp)**2)
-    return change_pen + 0.01*growth_pen
+    change_penalty = torch.mean(torch.abs(diff) / (t.view(-1,1,1,1,1) + 1e-6))
+    voxel_vol = 1.0
+    pred_vol = pred.sum(dim=[2,3,4]) * voxel_vol
+    expected_vol = info['growth_rate'].to(pred_vol.device) * t
+    growth_penalty = torch.mean((pred_vol - expected_vol).pow(2))
+    return change_penalty + 0.01 * growth_penalty
 
-# -----------------------------------------------------------------------------
-#  Validation & plotting
-# -----------------------------------------------------------------------------
 
-def validate(dl, enc, dec, vq, odeb, disc, device, temporal=False, gan=False):
-    enc.eval(); dec.eval(); vq.eval(); odeb.eval(); disc.eval()
-    mets = dict(recon=0, vq=0, phys=0, d_r=0, d_f=0); n=0
+# ---------------------- Validation & Utilities ----------------------
+def validate(dataloader, encoder, decoder, vq, odeblock, discriminator,
+             device, temporal=False, gan=False):
+    encoder.eval(); decoder.eval(); vq.eval(); odeblock.eval(); discriminator.eval()
+    metrics = {k:0 for k in ['recon','vq','phys','d_real','d_fake']}; count=0
     with torch.no_grad():
-        for batch in dl:
+        for vol, info, tp in dataloader:
+            vol, tp = vol.to(device), tp.to(device)
+            z = encoder(vol); q, vl = vq(z)
             if temporal:
-                vol, info, tp = batch
-                tp = tp.to(device)
-            else:
-                vol = batch
-            vol = vol.to(device)
-            z = enc(vol); q, vl = vq(z)
-            if temporal:
-                tpts = torch.stack([torch.zeros_like(tp),tp],0)
-                q = odeb(q,tpts)
-                pl = physics_loss(dec(q), info, tp)
-                mets['phys'] += pl.item()
-            recon = dec(q)
-            rl = nn.functional.mse_loss(recon, vol)
-            mets['recon'] += rl.item()
-            mets['vq'] += vl.item()
+                tpts = torch.stack([torch.zeros_like(tp), tp],0)
+                q = odeblock(q, tpts)
+                pl = compute_physics_loss(decoder(q), info, tp)
+                metrics['phys'] += pl.item()
+            recon = decoder(q)
+            metrics['recon'] += nn.functional.mse_loss(recon, vol).item()
+            metrics['vq'] += vl.item()
             if gan:
-                mets['d_r'] += disc(vol).mean().item()
-                mets['d_f'] += disc(recon).mean().item()
-            n += 1
-    for k in mets: mets[k] /= n
-    enc.train(); dec.train(); vq.train(); odeb.train(); disc.train()
-    return mets
+                metrics['d_real'] += discriminator(vol).mean().item()
+                metrics['d_fake'] += discriminator(recon).mean().item()
+            count += 1
+    for k in metrics: metrics[k] /= count
+    encoder.train(); decoder.train(); vq.train(); odeblock.train(); discriminator.train()
+    return metrics
 
-def plot_history(h, save_dir):
+
+def plot_history(history, save_dir):
     os.makedirs(save_dir, exist_ok=True)
-    for k,v in h.items():
-        plt.figure(); plt.plot(v); plt.title(k)
-        plt.savefig(os.path.join(save_dir, f"{k}.png"))
+    for key, vals in history.items():
+        plt.figure(); plt.plot(vals); plt.title(key)
+        plt.savefig(os.path.join(save_dir, f'{key}.png'))
         plt.close()
 
-# -----------------------------------------------------------------------------
-#  Training
-# -----------------------------------------------------------------------------
 
-def train_phase_recon(args):
-    ds = BraTSDataset(args.data_root)
-    dl = DataLoader(ds, batch_size=args.bs, shuffle=True, num_workers=4, pin_memory=True)
+# ---------------------- Training Loops ----------------------
+def train_recon(args):
+    train_ds = Brats2023Dataset(args.train_csv)
+    train_dl = DataLoader(train_ds, batch_size=args.bs, shuffle=True)
+    val_dl = DataLoader(Brats2023Dataset(args.val_csv), batch_size=args.bs) if args.val_csv else None
+
     device = torch.device(args.device)
-
-    enc = Encoder3D().to(device)
-    dec = Decoder3D().to(device)
-    vq  = VectorQuantizer(512,64).to(device)
-    disc= Discriminator3D().to(device)
-
-    opt_g = optim.Adam(list(enc.parameters())+list(dec.parameters())+list(vq.parameters()),
-                       lr=args.lr)
+    enc, dec = Encoder3D().to(device), Decoder3D().to(device)
+    vq = VectorQuantizer(512,64).to(device)
+    disc = Discriminator3D().to(device)
+    opt_g = optim.Adam(list(enc.parameters())+list(dec.parameters())+list(vq.parameters()), lr=args.lr)
     opt_d = optim.Adam(disc.parameters(), lr=args.lr, betas=(0.5,0.9))
 
     writer = SummaryWriter(args.logdir)
-    H = {'r':[],'vq':[],'dr':[],'df':[]}
+    history = {'train_recon':[], 'train_vq':[], 'train_d_real':[], 'train_d_fake':[],
+               'val_recon':[], 'val_vq':[], 'val_d_real':[], 'val_d_fake':[]}
 
     for ep in range(args.epochs):
-        sr=sv= sdr=sdf=0
-        for vol in dl:
+        sum_r=sum_v=sum_dr=sum_df=0
+        for vol, _, _ in train_dl:
             vol = vol.to(device)
-            # D step
+            # Discriminator step
             with torch.no_grad():
-                z = enc(vol); q,_ = vq(z); fake = dec(q)
-            pr = disc(vol); pf = disc(fake)
-            ld = torch.relu(1.-pr).mean() + torch.relu(1.+pf).mean()
-            opt_d.zero_grad(); ld.backward(); opt_d.step()
-            # G step
-            z = enc(vol); q,vl = vq(z); recon = dec(q)
-            rl = nn.functional.mse_loss(recon,vol)
-            lg = rl + vl + args.lambda_gan*(-disc(recon).mean())
-            opt_g.zero_grad(); lg.backward(); opt_g.step()
-            sr += rl.item(); sv += vl.item()
-            sdr+= pr.mean().item(); sdf+= pf.mean().item()
-        n=len(dl)
-        H['r'].append(sr/n); H['vq'].append(sv/n)
-        H['dr'].append(sdr/n);H['df'].append(sdf/n)
-        writer.add_scalar('R',sr/n,ep); writer.add_scalar('VQ',sv/n,ep)
-        writer.add_scalar('D_real',sdr/n,ep); writer.add_scalar('D_fake',sdf/n,ep)
-        print(f"[Recon][Ep{ep}] R={sr/n:.4f} VQ={sv/n:.4f} D_r={sdr/n:.4f} D_f={sdf/n:.4f}")
-    writer.close()
-    plot_history(H, args.save_dir)
+                z = enc(vol); q, _ = vq(z)
+                fake = dec(q)
+            pred_real = disc(vol); pred_fake = disc(fake)
+            loss_d = torch.mean(nn.functional.relu(1.0 - pred_real)) + torch.mean(nn.functional.relu(1.0 + pred_fake))
+            opt_d.zero_grad(); loss_d.backward(); opt_d.step()
 
-def train_phase_temporal(args):
-    tds = LongitudinalMRIDataset(args.train_csv)
-    vds = LongitudinalMRIDataset(args.val_csv) if args.val_csv else None
-    tdl = DataLoader(tds, batch_size=args.bs, shuffle=True, num_workers=4, pin_memory=True)
-    vdl = DataLoader(vds, batch_size=args.bs) if vds else None
+            # Generator step
+            z = enc(vol); q, vl = vq(z); recon = dec(q)
+            rl = nn.functional.mse_loss(recon, vol)
+            loss_gan = -disc(recon).mean()
+            loss_g = rl + vl + args.lambda_gan * loss_gan
+            opt_g.zero_grad(); loss_g.backward(); opt_g.step()
+
+            sum_r += rl.item(); sum_v += vl.item()
+            sum_dr += pred_real.mean().item(); sum_df += pred_fake.mean().item()
+
+        # Logging
+        history['train_recon'].append(sum_r/len(train_dl))
+        history['train_vq'].append(sum_v/len(train_dl))
+        history['train_d_real'].append(sum_dr/len(train_dl))
+        history['train_d_fake'].append(sum_df/len(train_dl))
+        writer.add_scalar('Train/Reconstruction', history['train_recon'][-1], ep)
+        writer.add_scalar('Train/VQ', history['train_vq'][-1], ep)
+        writer.add_scalar('Train/D_real', history['train_d_real'][-1], ep)
+        writer.add_scalar('Train/D_fake', history['train_d_fake'][-1], ep)
+
+        if val_dl:
+            m = validate(val_dl, enc, dec, vq, ODEBlock(ODEFunc(1)), disc, device, temporal=False, gan=True)
+            for k in ['recon','vq','d_real','d_fake']:
+                history[f'val_{k}'].append(m[k])
+                writer.add_scalar(f'Val/{k.capitalize()}', m[k], ep)
+
+        print(f"[Recon][Epoch {ep}] R={history['train_recon'][-1]:.4f} VQ={history['train_vq'][-1]:.4f} D_r={history['train_d_real'][-1]:.4f} D_f={history['train_d_fake'][-1]:.4f}")
+
+    writer.close()
+    plot_history(history, args.save_dir)
+
+
+def train_temporal(args):
+    train_ds = LumiereDataset(args.train_csv)
+    train_dl = DataLoader(train_ds, batch_size=args.bs, shuffle=True)
+    val_dl = DataLoader(LumiereDataset(args.val_csv), batch_size=args.bs) if args.val_csv else None
 
     device = torch.device(args.device)
-    enc = Encoder3D().to(device)
-    dec = Decoder3D().to(device)
-    vq  = VectorQuantizer(512,64).to(device)
-    disc= Discriminator3D().to(device)
+    enc, dec = Encoder3D().to(device), Decoder3D().to(device)
+    vq = VectorQuantizer(512,64).to(device)
+    disc = Discriminator3D().to(device)
 
-    # latent dim
-    with torch.no_grad():
-        dummy = torch.zeros(1,64,32,32,32)
-        latent_dim = dummy.numel()
+    # latent dimension calculation
+    dummy = torch.zeros(1,64,32,32,64)
+    latent_dim = dummy.numel()
     func = ODEFunc(latent_dim).to(device)
     odeb = ODEBlock(func).to(device)
 
-    opt_g = optim.Adam(list(enc.parameters())+
-                       list(dec.parameters())+
-                       list(vq.parameters())+
-                       list(func.parameters()),
-                       lr=args.lr)
+    opt_g = optim.Adam(list(enc.parameters())+list(dec.parameters())+list(vq.parameters())+list(func.parameters()), lr=args.lr)
     opt_d = optim.Adam(disc.parameters(), lr=args.lr, betas=(0.5,0.9))
-
     writer = SummaryWriter(args.logdir)
-    H = {'r':[],'vq':[],'ph':[],'dr':[],'df':[]}
+
+    history = {'train_recon':[], 'train_vq':[], 'train_phys':[], 'train_d_real':[], 'train_d_fake':[],
+               'val_recon':[], 'val_vq':[], 'val_phys':[], 'val_d_real':[], 'val_d_fake':[]}
 
     for ep in range(args.epochs):
-        sr=sv=sph=sdr=sdf=0
-        for vol, info, tp in tdl:
+        sum_r=sum_v=sum_p=sum_dr=sum_df=0
+        for vol, info, tp in train_dl:
             vol, tp = vol.to(device), tp.to(device)
-            # D
+            # Discriminator
             with torch.no_grad():
-                z = enc(vol); q,_ = vq(z)
-                tpts = torch.stack([torch.zeros_like(tp),tp],0)
-                lat = odeb(q,tpts)
+                z = enc(vol); q, _ = vq(z)
+                tpts = torch.stack([torch.zeros_like(tp), tp], 0)
+                lat = odeb(q, tpts)
                 fake = dec(lat)
-            pr, pf = disc(vol), disc(fake)
-            ld = torch.relu(1.-pr).mean()+torch.relu(1.+pf).mean()
-            opt_d.zero_grad(); ld.backward(); opt_d.step()
-            # G
-            z = enc(vol); q,vl = vq(z)
-            tpts = torch.stack([torch.zeros_like(tp),tp],0)
-            lat = odeb(q,tpts)
+            pred_real = disc(vol); pred_fake = disc(fake)
+            loss_d = torch.mean(nn.functional.relu(1.0 - pred_real)) + torch.mean(nn.functional.relu(1.0 + pred_fake))
+            opt_d.zero_grad(); loss_d.backward(); opt_d.step()
+
+            # Generator
+            z = enc(vol); q, vl = vq(z)
+            tpts = torch.stack([torch.zeros_like(tp), tp], 0)
+            lat = odeb(q, tpts)
             recon = dec(lat)
-            rl = nn.functional.mse_loss(recon,vol)
-            pl = physics_loss(recon, info, tp)
-            lg = rl + vl + 0.1*pl + args.lambda_gan*(-disc(recon).mean())
-            opt_g.zero_grad(); lg.backward(); opt_g.step()
-            sr+=rl.item(); sv+=vl.item(); sph+=pl.item()
-            sdr+=pr.mean().item(); sdf+=pf.mean().item()
 
-        n=len(tdl)
-        H['r'].append(sr/n); H['vq'].append(sv/n); H['ph'].append(sph/n)
-        H['dr'].append(sdr/n);H['df'].append(sdf/n)
-        writer.add_scalar('R',sr/n,ep); writer.add_scalar('VQ',sv/n,ep)
-        writer.add_scalar('Phys',sph/n,ep)
-        writer.add_scalar('D_real',sdr/n,ep); writer.add_scalar('D_fake',sdf/n,ep)
-        print(f"[Temp][Ep{ep}] R={sr/n:.4f} VQ={sv/n:.4f} Ph={sph/n:.4f} D_r={sdr/n:.4f} D_f={sdf/n:.4f}")
+            rl = nn.functional.mse_loss(recon, vol)
+            pl = compute_physics_loss(recon, info, tp)
+            loss_gan = -disc(recon).mean()
+            loss_g = rl + vl + 0.1 * pl + args.lambda_gan * loss_gan
 
-        if vdl:
-            m = validate(vdl, enc, dec, vq, odeb, disc, device, temporal=True, gan=True)
-            print("  >> val:", m)
+            opt_g.zero_grad(); loss_g.backward(); opt_g.step()
+
+            sum_r += rl.item(); sum_v += vl.item(); sum_p += pl.item()
+            sum_dr += pred_real.mean().item(); sum_df += pred_fake.mean().item()
+
+        history['train_recon'].append(sum_r/len(train_dl))
+        history['train_vq'].append(sum_v/len(train_dl))
+        history['train_phys'].append(sum_p/len(train_dl))
+        history['train_d_real'].append(sum_dr/len(train_dl))
+        history['train_d_fake'].append(sum_df/len(train_dl))
+
+        writer.add_scalar('Train/Reconstruction', history['train_recon'][-1], ep)
+        writer.add_scalar('Train/VQ', history['train_vq'][-1], ep)
+        writer.add_scalar('Train/Physics', history['train_phys'][-1], ep)
+        writer.add_scalar('Train/D_real', history['train_d_real'][-1], ep)
+        writer.add_scalar('Train/D_fake', history['train_d_fake'][-1], ep)
+
+        if val_dl:
+            m = validate(val_dl, enc, dec, vq, odeb, disc, device, temporal=True, gan=True)
+            for k in ['recon','vq','phys','d_real','d_fake']:
+                history[f'val_{k}'].append(m[k])
+                writer.add_scalar(f'Val/{k.capitalize()}', m[k], ep)
+
+        print(f"[Temporal][Epoch {ep}] R={history['train_recon'][-1]:.4f} VQ={history['train_vq'][-1]:.4f} P={history['train_phys'][-1]:.4f} D_r={history['train_d_real'][-1]:.4f} D_f={history['train_d_fake'][-1]:.4f}")
 
     writer.close()
-    plot_history(H, args.save_dir)
+    plot_history(history, args.save_dir)
 
-# -----------------------------------------------------------------------------
-#  CLI & dispatch
-# -----------------------------------------------------------------------------
 
-if __name__=='__main__':
-    p=argparse.ArgumentParser()
-    p.add_argument('--phase', choices=['recon','temporal'], required=True)
-    # recon args
-    p.add_argument('--data_root', help="BraTS23 root for recon phase")
-    # temporal args
-    p.add_argument('--train_csv', help="CSV for longitudinal TCIA")
-    p.add_argument('--val_csv',   default=None)
-    # shared
-    p.add_argument('--bs', type=int, default=2)
-    p.add_argument('--lr', type=float, default=1e-4)
-    p.add_argument('--epochs', type=int, default=50)
-    p.add_argument('--device', default='cuda')
-    p.add_argument('--logdir', default='runs/exp')
-    p.add_argument('--save_dir', default='outputs')
-    p.add_argument('--lambda_gan', type=float, default=1.0)
-    args = p.parse_args()
-
-    if args.phase=='recon':
-        assert args.data_root, "--data_root is required for recon"
-        train_phase_recon(args)
+# ---------------------- Entry Point ----------------------
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['train_recon','train_temporal'], default='train_recon')
+    parser.add_argument('--train_csv', required=True)
+    parser.add_argument('--val_csv', default=None)
+    parser.add_argument('--bs', type=int, default=2)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--logdir', type=str, default='runs/exp')
+    parser.add_argument('--save_dir', type=str, default='outputs')
+    parser.add_argument('--lambda_gan', type=float, default=1.0, help='weight for adversarial loss')
+    args = parser.parse_args()
+    if args.mode == 'train_recon':
+        train_recon(args)
     else:
-        assert args.train_csv, "--train_csv is required for temporal"
-        train_phase_temporal(args)
+        train_temporal(args)
