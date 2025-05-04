@@ -41,26 +41,27 @@ import matplotlib.pyplot as plt
 
 # ---------------------- Dataset Loaders ----------------------
 class Brats2023Dataset(Dataset):
-    """Static dataset for single-timepoint BraTS 2023 reconstruction"""
     def __init__(self, csv_path, transform=None):
         self.entries = []
         with open(csv_path, 'r') as f:
             reader = csv.reader(f)
-            for pid, img_path in reader:
-                self.entries.append((pid, img_path))
+            for pid, tp, path in reader:
+                # tp is your timepoint (for reconstruction you can ignore or set to 0)
+                self.entries.append((pid, float(tp), path))
         self.transform = transform
 
     def __len__(self):
         return len(self.entries)
 
     def __getitem__(self, idx):
-        pid, img_path = self.entries[idx]
-        img = nib.load(img_path).get_fdata().astype('float32')
+        pid, timepoint, path = self.entries[idx]
+        img = nib.load(path).get_fdata().astype('float32')
         vol = torch.from_numpy(img).unsqueeze(0)  # [1,H,W,D]
         if self.transform:
             vol = self.transform(vol)
-        # info and dummy timepoint (unused in reconstruction)
-        return vol, {'patient_id': pid}, torch.tensor(0.0)
+        # return the same info dict and timepoint tensor as in your LongitudinalMRIDataset
+        return vol, {'patient_id': pid, 'growth_rate': 0.05}, torch.tensor(timepoint)
+
 
 
 class LumiereDataset(Dataset):
