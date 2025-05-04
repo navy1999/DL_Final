@@ -46,7 +46,6 @@ class Brats2023Dataset(Dataset):
         with open(csv_path, 'r') as f:
             reader = csv.reader(f)
             for pid, tp, path in reader:
-                # tp is your timepoint (for reconstruction you can ignore or set to 0)
                 self.entries.append((pid, float(tp), path))
         self.transform = transform
 
@@ -56,13 +55,25 @@ class Brats2023Dataset(Dataset):
     def __getitem__(self, idx):
         pid, timepoint, path = self.entries[idx]
         img = nib.load(path).get_fdata().astype('float32')
-        vol = torch.from_numpy(img).unsqueeze(0)  # [1,H,W,D]
+        vol = torch.from_numpy(img).unsqueeze(0)  # [C=1, H, W, D]
+
+        # --- pad depth so D % 4 == 0 ---
+        _, H, W, D = vol.shape
+        pad_d = (4 - (D % 4)) % 4   # if D%4 !=0, pad_d = 4 - (D%4)
+        if pad_d:
+            # create zeros of shape [1,H,W,pad_d]
+            zeros = torch.zeros(vol.shape[0], H, W, pad_d,
+                                dtype=vol.dtype, device=vol.device)
+            # concatenate along depth axis (last dim)
+            vol = torch.cat([vol, zeros], dim=3)
+        # ----------------------------------
+
         if self.transform:
             vol = self.transform(vol)
-        # return the same info dict and timepoint tensor as in your LongitudinalMRIDataset
-        return vol, {'patient_id': pid, 'growth_rate': 0.05}, torch.tensor(timepoint)
 
-
+        # your growth_rate etc can be set here or passed through info dict
+        info = {'patient_id': pid, 'growth_rate': 0.05}
+        return vol, info, torch.tensor(timepoint)
 
 class LumiereDataset(Dataset):
     """Longitudinal dataset loader for LUMIERE temporal modeling"""
