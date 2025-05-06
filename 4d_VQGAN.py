@@ -151,7 +151,7 @@ class ODEFunc(nn.Module):
         )
     def forward(self, t, z): return self.net(z)
 
-
+'''
 class ODEBlock(nn.Module):
     def __init__(self, func, method='rk4', tol=1e-3):
         super().__init__()
@@ -164,6 +164,30 @@ class ODEBlock(nn.Module):
                                  method=self.method,
                                  atol=self.tol, rtol=self.tol)
         return out[-1].reshape(B, C, H, W, D)
+'''
+class ODEBlock(nn.Module):
+    def __init__(self, func, method='rk4', tol=1e-3):
+        super().__init__()
+        self.func = func
+        self.method = method
+        self.tol = tol
+
+    def forward(self, z, timepts):
+        B, C, H, W, D = z.shape
+        # Reshape to (B*H*W*D, C) for voxel-wise ODE
+        z_flat = z.permute(0, 2, 3, 4, 1).reshape(-1, C)  # [B*H*W*D, C]
+
+        # Apply ODE integration
+        out = torchdiffeq.odeint(
+            self.func, z_flat, timepts.to(z.device),
+            method=self.method,
+            atol=self.tol,
+            rtol=self.tol
+        )
+
+        # Take the final step output and reshape back to [B, C, H, W, D]
+        z_evolved = out[-1].reshape(B, H, W, D, C).permute(0, 4, 1, 2, 3)
+        return z_evolved
 
 
 # ---------------------- Physics-Informed Loss ----------------------
