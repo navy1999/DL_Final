@@ -21,7 +21,8 @@ class Brats2023Dataset(Dataset):
     def __init__(self, csv_path, transform=None):
         self.entries = []
         with open(csv_path) as f:
-            reader = csv.reader(f); next(reader, None)
+            reader = csv.reader(f)
+            next(reader, None)
             for pid, tp, path in reader:
                 self.entries.append((pid, float(tp), path))
         self.transform = transform
@@ -32,25 +33,35 @@ class Brats2023Dataset(Dataset):
     def __getitem__(self, idx):
         pid, tp, path = self.entries[idx]
         img = nib.load(path).get_fdata().astype('float32')
-        vol = torch.from_numpy(img).unsqueeze(0)  # [1,H,W,D]
+        vol = torch.from_numpy(img).unsqueeze(0)  # [C=1, H, W, D]
 
-        # pad H,W,D up to multiples of 4
+        # --- NEW PADDING LOGIC ---
+        # Pad H, W, D up to a multiple of 4 AND ensure each >= 4
         C, H, W, D = vol.shape
         pad_h = (4 - (H % 4)) % 4
+        if H + pad_h < 4:
+            pad_h = 4 - H
         pad_w = (4 - (W % 4)) % 4
+        if W + pad_w < 4:
+            pad_w = 4 - W
         pad_d = (4 - (D % 4)) % 4
-        if pad_h or pad_w or pad_d:
-            # NOTE: pad order for 5D (N,C,D,H,W) is
-            # (W_left, W_right, H_left, H_right, D_left, D_right)
-            vol = nn.functional.pad(vol,
-                        (0, pad_d,   # pad D
-                         0, pad_w,   # pad W
-                         0, pad_h),  # pad H
-                        mode='constant', value=0.0)
+        if D + pad_d < 4:
+            pad_d = 4 - D
 
+        if pad_h or pad_w or pad_d:
+            # For a 4D tensor [C,H,W,D], pad order is
+            # (D_left, D_right, W_left, W_right, H_left, H_right)
+            vol = nn.functional.pad(vol,
+                                    (0, pad_d,    # pad D
+                                     0, pad_w,    # pad W
+                                     0, pad_h),   # pad H
+                                    mode='constant', value=0.0)
+
+        # normalize
         vol = (vol - vol.min()) / (vol.max() - vol.min() + 1e-6)
         if self.transform:
             vol = self.transform(vol)
+
         return vol, {'patient_id': pid, 'growth_rate': torch.tensor(0.05)}, torch.tensor(tp)
 
 
@@ -58,7 +69,8 @@ class LumiereDataset(Dataset):
     def __init__(self, csv_path, transform=None):
         self.entries = []
         with open(csv_path) as f:
-            reader = csv.reader(f); next(reader, None)
+            reader = csv.reader(f)
+            next(reader, None)
             for pid, tp, path in reader:
                 self.entries.append((pid, float(tp), path))
         self.transform = transform
@@ -71,21 +83,29 @@ class LumiereDataset(Dataset):
         img = nib.load(path).get_fdata().astype('float32')
         vol = torch.from_numpy(img).unsqueeze(0)
 
-        # pad H,W,D up to multiples of 4
+        # --- NEW PADDING LOGIC ---
         C, H, W, D = vol.shape
         pad_h = (4 - (H % 4)) % 4
+        if H + pad_h < 4:
+            pad_h = 4 - H
         pad_w = (4 - (W % 4)) % 4
+        if W + pad_w < 4:
+            pad_w = 4 - W
         pad_d = (4 - (D % 4)) % 4
+        if D + pad_d < 4:
+            pad_d = 4 - D
+
         if pad_h or pad_w or pad_d:
             vol = nn.functional.pad(vol,
-                        (0, pad_d,   # pad D
-                         0, pad_w,   # pad W
-                         0, pad_h),  # pad H
-                        mode='constant', value=0.0)
+                                    (0, pad_d,
+                                     0, pad_w,
+                                     0, pad_h),
+                                    mode='constant', value=0.0)
 
         vol = (vol - vol.min()) / (vol.max() - vol.min() + 1e-6)
         if self.transform:
             vol = self.transform(vol)
+
         return vol, {'patient_id': pid, 'growth_rate': torch.tensor(0.05)}, torch.tensor(tp)
 
 
@@ -104,8 +124,7 @@ class VectorQuantizer(nn.Module):
                - 2*flat @ self.embedding.weight.t() \
                + self.embedding.weight.pow(2).sum(1)
         idx = torch.argmin(dist, dim=1)
-        enc = torch.zeros(idx.size(0), self.embedding.num_embeddings,
-                          device=x.device)
+        enc = torch.zeros(idx.size(0), self.embedding.num_embeddings, device=x.device)
         enc.scatter_(1, idx.unsqueeze(1), 1)
         quant_flat = enc @ self.embedding.weight
         quant = quant_flat.view(B, H, W, D, C).permute(0,4,1,2,3)
@@ -130,14 +149,14 @@ class Encoder3D(nn.Module):
 class Decoder3D(nn.Module):
     def __init__(self, emb=64, hidden=64, out=1):
         super().__init__()
-        # split into two blocks for checkpointing
         self.block1 = nn.Sequential(
-            nn.ConvTranspose3d(emb, hidden, 4,2,1), nn.ReLU(),
+            nn.ConvTranspose3d(emb, hidden, 4, 2, 1),
+            nn.ReLU(),
         )
         self.block2 = nn.Sequential(
-            nn.ConvTranspose3d(hidden, hidden, 4,2,1),
+            nn.ConvTranspose3d(hidden, hidden, 4, 2, 1),
             nn.ReLU(),
-            nn.Conv3d(hidden, out, 3,1,1),
+            nn.Conv3d(hidden, out, 3, 1, 1),
             nn.Sigmoid(),
         )
     def forward(self, x):
@@ -150,12 +169,10 @@ class Discriminator3D(nn.Module):
         super().__init__()
         layers, prev = [], in_ch
         for f in features:
-            layers += [
-                nn.Conv3d(prev, f, 4,2,1),
-                nn.LeakyReLU(0.2, inplace=True)
-            ]
+            layers += [nn.Conv3d(prev, f, 4, 2, 1),
+                       nn.LeakyReLU(0.2, inplace=True)]
             prev = f
-        layers += [nn.Conv3d(prev, 1, 4,1,0)]
+        layers += [nn.Conv3d(prev, 1, 4, 1, 0)]
         self.net = nn.Sequential(*layers)
     def forward(self, x): return self.net(x)
 
@@ -175,7 +192,6 @@ class ODEBlock(nn.Module):
     def __init__(self, func, method='rk4', tol=1e-3):
         super().__init__()
         self.func, self.method, self.tol = func, method, tol
-
     def forward(self, z, timepts):
         if timepts[0] == timepts[-1]:
             return z
@@ -213,6 +229,7 @@ def train_recon(args):
                         batch_size=args.bs, shuffle=True)
     val_dl = DataLoader(Brats2023Dataset(args.val_csv),
                         batch_size=args.bs) if args.val_csv else None
+
     os.makedirs(args.save_dir, exist_ok=True)
     dev = torch.device(args.device)
 
@@ -239,8 +256,7 @@ def train_recon(args):
 
         for bi,(vol,_,_) in enumerate(dl,1):
             vol = vol.to(dev)
-
-            # Discriminator step
+            # discriminator step
             if not is_pre and bi%args.disc_freq==0:
                 with autocast():
                     z,_   = vq(enc(vol))
@@ -252,7 +268,7 @@ def train_recon(args):
                 scaler.step(opt_d); scaler.update()
                 sum_dr+=pr.mean().item(); sum_df+=pf.mean().item()
 
-            # Generator + VQ step
+            # generator + vq step
             with autocast():
                 z, vq_loss = vq(enc(vol))
                 recon      = dec(z)
@@ -289,6 +305,7 @@ def train_temporal(args):
                         batch_size=args.bs, shuffle=True)
     val_dl = DataLoader(LumiereDataset(args.val_csv),
                         batch_size=args.bs) if args.val_csv else None
+
     os.makedirs(args.save_dir, exist_ok=True)
     dev = torch.device(args.device)
 
@@ -322,15 +339,15 @@ def train_temporal(args):
         for bi,(vol,info,tp) in enumerate(dl,1):
             vol, tp = vol.to(dev), tp.to(dev)
 
-            # Discriminator
+            # discriminator step
             if not is_pre and bi%args.disc_freq==0:
                 with autocast():
                     z,_  = vq(enc(vol))
                     lat  = []
                     for i in range(z.size(0)):
                         zi   = z[i:i+1]
-                        t_i  = tp[i].item()
-                        tpts = torch.tensor([0.0,t_i], device=dev)
+                        ti   = tp[i].item()
+                        tpts = torch.tensor([0.0, ti], device=dev)
                         lat.append( odeb(zi, tpts) )
                     fake = dec(torch.cat(lat,0))
                     pr,pf = disc(vol), disc(fake)
@@ -340,19 +357,19 @@ def train_temporal(args):
                 scaler.step(opt_d); scaler.update()
                 sum_dr+=pr.mean().item(); sum_df+=pf.mean().item()
 
-            # Generator + VQ + Physics
+            # generator + vq + physics step
             with autocast():
                 z, vq_loss = vq(enc(vol))
-                lat  = []
+                lat = []
                 for i in range(z.size(0)):
                     zi   = z[i:i+1]
-                    t_i  = tp[i].item()
-                    tpts = torch.tensor([0.0,t_i], device=dev)
+                    ti   = tp[i].item()
+                    tpts = torch.tensor([0.0, ti], device=dev)
                     lat.append( odeb(zi, tpts) )
                 lat   = torch.cat(lat,0)
                 recon = dec(lat)
 
-                # auto-crop on H,W,D
+                # auto-crop so recon/vol match exactly
                 mh = min(recon.size(2), vol.size(2))
                 mw = min(recon.size(3), vol.size(3))
                 md = min(recon.size(4), vol.size(4))
@@ -371,9 +388,9 @@ def train_temporal(args):
             sum_r+=rl.item(); sum_v+=vq_loss.item(); sum_p+=pl.item()
 
             if args.batch_verbose and bi%args.batch_verbose==0:
-                msg=f"  [B{bi}/{len(dl)}] R={sum_r/bi:.4f} VQ={sum_v/bi:.4f} P={sum_p/bi:.4f}"
+                msg  = f"  [B{bi}/{len(dl)}] R={sum_r/bi:.4f} VQ={sum_v/bi:.4f} P={sum_p/bi:.4f}"
                 if not is_pre:
-                    c=bi//args.disc_freq
+                    c = bi//args.disc_freq
                     msg+=f" D_r={sum_dr/max(1,c):.4f} D_f={sum_df/max(1,c):.4f}"
                 print(msg)
 
